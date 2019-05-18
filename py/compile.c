@@ -2450,6 +2450,39 @@ STATIC void compile_comprehension(compiler_t *comp, mp_parse_node_struct_t *pns,
     EMIT_ARG(call_function, 1, 0, 0);
 }
 
+#if MICROPY_PY_FSTRING
+STATIC void compile_atom_string(compiler_t *comp, mp_parse_node_struct_t *pns) {
+    EMIT_ARG(load_const_str, QSTR_FROM_STR_STATIC(""));
+    EMIT_ARG(load_method, MP_QSTR_join, false);
+    int num_nodes = MP_PARSE_NODE_STRUCT_NUM_NODES(pns);
+    int num_non_empty_nodes = 0;
+    for (int i = 0; i < num_nodes; i++) {
+        if (MP_PARSE_NODE_IS_LEAF(pns->nodes[i]) 
+            && MP_PARSE_NODE_LEAF_KIND(pns->nodes[i]) == MP_PARSE_NODE_STRING 
+            && qstr_len(MP_PARSE_NODE_LEAF_ARG(pns->nodes[i])) == 0) {
+            // this is an empty literal section in the f-string, so it can be skipped
+            continue;
+        }
+        compile_node(comp, pns->nodes[i]);
+        if (comp->compile_error != MP_OBJ_NULL) {
+            // add line info for the error in case it didn't have a line number
+            compile_error_set_line(comp, pns->nodes[i]);
+            return;
+        }
+        num_non_empty_nodes++;
+    }
+    EMIT_ARG(build, num_non_empty_nodes, MP_EMIT_BUILD_LIST);
+    EMIT_ARG(call_method, 1, 0, 0);
+}
+
+STATIC void compile_formatted_value(compiler_t *comp, mp_parse_node_struct_t *pns) {
+    compile_node(comp, pns->nodes[1]);
+    EMIT_ARG(load_method, MP_QSTR_format, false);
+    compile_node(comp, pns->nodes[0]);
+    EMIT_ARG(call_method, 1, 0, 0);
+}
+#endif
+
 STATIC void compile_atom_paren(compiler_t *comp, mp_parse_node_struct_t *pns) {
     if (MP_PARSE_NODE_IS_NULL(pns->nodes[0])) {
         // an empty tuple

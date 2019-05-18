@@ -141,7 +141,20 @@ typedef enum _mp_token_kind_t {
     MP_TOKEN_DEL_DBL_LESS_EQUAL,
     MP_TOKEN_DEL_DBL_STAR_EQUAL,
     MP_TOKEN_DEL_MINUS_MORE,
+    #if MICROPY_PY_FSTRING
+    MP_TOKEN_DEL_FORMATTED_VALUE_OPEN,
+    MP_TOKEN_DEL_FORMATTED_VALUE_CLOSE,
+    #endif
 } mp_token_kind_t;
+
+#if MICROPY_PY_FSTRING
+typedef enum {
+    MP_FSTRING_SECTION_NONE,
+    MP_FSTRING_SECTION_LITERAL,
+    MP_FSTRING_SECTION_FORMATTED_VALUE,
+    MP_FSTRING_SECTION_FORMATTED_VALUE_END,
+} mp_fstring_section_t;
+#endif
 
 // this data structure is exposed for efficiency
 // public members are: source_name, tok_line, tok_column, tok_kind, vstr
@@ -160,6 +173,13 @@ typedef struct _mp_lexer_t {
     size_t alloc_indent_level;
     size_t num_indent_level;
     uint16_t *indent_level;
+
+    #if MICROPY_PY_FSTRING
+    char fstring_quote_char;          // quote char used in current f-string
+    size_t fstring_num_quotes;        // number of closing quotes for current f-string
+    bool fstring_is_raw;              // current f-string is raw
+    mp_fstring_section_t fstring_section;  // section of the f-string being parsed
+    #endif
 
     size_t tok_line;            // token source line
     size_t tok_column;          // token source column

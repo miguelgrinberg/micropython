@@ -62,6 +62,12 @@ STATIC bool is_char_or3(mp_lexer_t *lex, byte c1, byte c2, byte c3) {
     return lex->chr0 == c1 || lex->chr0 == c2 || lex->chr0 == c3;
 }
 
+#if MICROPY_PY_FSTRING
+STATIC bool is_char_or4(mp_lexer_t *lex, byte c1, byte c2, byte c3, byte c4) {
+    return lex->chr0 == c1 || lex->chr0 == c2 || lex->chr0 == c3 || lex->chr0 == c4;
+}
+#endif
+
 STATIC bool is_char_following(mp_lexer_t *lex, byte c) {
     return lex->chr1 == c;
 }
@@ -104,11 +110,46 @@ STATIC bool is_following_odigit(mp_lexer_t *lex) {
 }
 
 STATIC bool is_string_or_bytes(mp_lexer_t *lex) {
+#if MICROPY_PY_FSTRING
+    return is_char_or(lex, '\'', '\"')
+        || (is_char_or4(lex, 'r', 'u', 'b', 'f') && is_char_following_or(lex, '\'', '\"'))
+        || ((is_char_and(lex, 'r', 'b') || is_char_and(lex, 'b', 'r'))
+            && is_char_following_following_or(lex, '\'', '\"'))
+        || ((is_char_and(lex, 'r', 'f') || is_char_and(lex, 'f', 'r'))
+            && is_char_following_following_or(lex, '\'', '\"'));
+#else
     return is_char_or(lex, '\'', '\"')
         || (is_char_or3(lex, 'r', 'u', 'b') && is_char_following_or(lex, '\'', '\"'))
         || ((is_char_and(lex, 'r', 'b') || is_char_and(lex, 'b', 'r'))
             && is_char_following_following_or(lex, '\'', '\"'));
+#endif
 }
+
+STATIC bool is_inside_fstring(mp_lexer_t *lex) {
+#if MICROPY_PY_FSTRING
+    return lex->fstring_section != MP_FSTRING_SECTION_NONE;
+#else
+    return false;
+#endif
+}
+
+STATIC bool is_fstring_literal(mp_lexer_t *lex) {
+#if MICROPY_PY_FSTRING
+    return lex->fstring_section == MP_FSTRING_SECTION_LITERAL;
+#else
+    return false;
+#endif
+}
+
+#if MICROPY_PY_FSTRING
+STATIC bool is_fstring_formatted_value(mp_lexer_t *lex) {
+    return is_inside_fstring(lex) && lex->fstring_section == MP_FSTRING_SECTION_FORMATTED_VALUE;
+}
+
+STATIC bool is_fstring_formatted_value_end(mp_lexer_t *lex) {
+    return is_inside_fstring(lex) && lex->fstring_section == MP_FSTRING_SECTION_FORMATTED_VALUE_END;
+}
+#endif
 
 // to easily parse utf-8 identifiers we allow any raw byte with high bit set
 STATIC bool is_head_of_identifier(mp_lexer_t *lex) {
@@ -268,27 +309,50 @@ STATIC bool get_hex(mp_lexer_t *lex, size_t num_digits, mp_uint_t *result) {
     return true;
 }
 
-STATIC void parse_string_literal(mp_lexer_t *lex, bool is_raw) {
-    // get first quoting character
+STATIC void parse_string_literal(mp_lexer_t *lex, bool is_raw, bool is_fstring) {
     char quote_char = '\'';
-    if (is_char(lex, '\"')) {
-        quote_char = '\"';
-    }
-    next_char(lex);
-
-    // work out if it's a single or triple quoted literal
     size_t num_quotes;
-    if (is_char_and(lex, quote_char, quote_char)) {
-        // triple quotes
+
+    if (!is_inside_fstring(lex) || is_fstring_formatted_value(lex)) {
+        // get first quoting character
+        if (is_char(lex, '\"')) {
+            quote_char = '\"';
+        }
         next_char(lex);
-        next_char(lex);
-        num_quotes = 3;
-    } else {
-        // single quotes
-        num_quotes = 1;
+
+        // work out if it's a single or triple quoted literal
+        if (is_char_and(lex, quote_char, quote_char)) {
+            // triple quotes
+            next_char(lex);
+            next_char(lex);
+            num_quotes = 3;
+        } else {
+            // single quotes
+            num_quotes = 1;
+        }
+
+        #if MICROPY_PY_FSTRING
+        if (is_fstring) {
+            // save details of the f-string so that they can be recalled for later sections
+            lex->fstring_quote_char = quote_char;
+            lex->fstring_num_quotes = num_quotes;
+            lex->fstring_is_raw = is_raw;
+            lex->fstring_section = MP_FSTRING_SECTION_LITERAL;
+        }
+        #endif
+    } 
+    #if MICROPY_PY_FSTRING
+    else {
+        // we are parsing a section of an f-string, restore f-string details
+        quote_char = lex->fstring_quote_char;
+        num_quotes = lex->fstring_num_quotes;
+        is_raw = lex->fstring_is_raw;
+        is_fstring = true;
     }
+    #endif
 
     size_t n_closing = 0;
+    bool fstring_break = false;
     while (!is_end(lex) && (num_quotes > 1 || !is_char(lex, '\n')) && n_closing < num_quotes) {
         if (is_char(lex, quote_char)) {
             n_closing += 1;
@@ -381,6 +445,28 @@ STATIC void parse_string_literal(mp_lexer_t *lex, bool is_raw) {
                         }
                     }
                 }
+            #if MICROPY_PY_FSTRING
+            } else if (is_fstring && is_char(lex, '{')) {
+                if (is_char_following(lex, '{')) {
+                    // the brace was escaped with a second brace
+                    vstr_add_byte(&lex->vstr, CUR_CHAR(lex));
+                    next_char(lex);
+                }
+                else {
+                    fstring_break = true;
+                    break;
+                }
+            } else if (is_fstring && is_char(lex, '}')) {
+                if (is_char_following(lex, '}')) {
+                    // the brace was escaped with a second brace
+                    vstr_add_byte(&lex->vstr, CUR_CHAR(lex));
+                    next_char(lex);
+                }
+                else {
+                    // can't have an unescaped closing brace in an f-string
+                    lex->tok_kind = MP_TOKEN_INVALID;
+                }
+            #endif
             } else {
                 // Add the "character" as a byte so that we remain 8-bit clean.
                 // This way, strings are parsed correctly whether or not they contain utf-8 chars.
@@ -390,13 +476,57 @@ STATIC void parse_string_literal(mp_lexer_t *lex, bool is_raw) {
         next_char(lex);
     }
 
-    // check we got the required end quotes
-    if (n_closing < num_quotes) {
-        lex->tok_kind = MP_TOKEN_LONELY_STRING_OPEN;
+    if (!fstring_break) {
+        // check we got the required end quotes
+        if (n_closing < num_quotes) {
+            lex->tok_kind = MP_TOKEN_LONELY_STRING_OPEN;
+        }
+
+        // cut off the end quotes from the token text
+        vstr_cut_tail_bytes(&lex->vstr, n_closing);
+
+        #if MICROPY_PY_FSTRING
+        if (is_fstring_literal(lex)) {
+            // we reached the end of the f-string
+            // reset f-string state in the lexer
+            lex->fstring_quote_char = 0;
+            lex->fstring_num_quotes = 0;
+            lex->fstring_is_raw = false;
+            lex->fstring_section = MP_FSTRING_SECTION_NONE;
+        }
+        #endif
+    }
+    #if MICROPY_PY_FSTRING
+    else {
+        // mark the beginning of a formatted value section for next token
+        lex->fstring_section = MP_FSTRING_SECTION_FORMATTED_VALUE;
+    }
+    #endif
+}
+
+STATIC void parse_fstring_format(mp_lexer_t *lex, char first_char) {
+    // the format specification is pushed as a string
+    lex->tok_kind = MP_TOKEN_STRING;
+
+    // for convenience, we push the format string with { and } around it so that it is ready for str.format()
+    vstr_add_byte(&lex->vstr, '{');
+
+    if (first_char != '}') {
+        vstr_add_byte(&lex->vstr, first_char);
+        while (!is_char(lex, '}') && !is_char(lex, '\n')) {
+            vstr_add_byte(&lex->vstr, CUR_CHAR(lex));
+            next_char(lex);
+        }
+        if (!is_char(lex, '}')) {
+            lex->tok_kind = MP_TOKEN_INVALID;
+        }
+        next_char(lex);
     }
 
-    // cut off the end quotes from the token text
-    vstr_cut_tail_bytes(&lex->vstr, n_closing);
+    vstr_add_byte(&lex->vstr, '}');
+
+    // mark the end of the formatted value
+    lex->fstring_section = MP_FSTRING_SECTION_FORMATTED_VALUE_END;
 }
 
 STATIC bool skip_whitespace(mp_lexer_t *lex, bool stop_at_newline) {
@@ -432,7 +562,13 @@ void mp_lexer_to_next(mp_lexer_t *lex) {
     vstr_reset(&lex->vstr);
 
     // skip white space and comments
+    #if MICROPY_PY_FSTRING
+    bool had_physical_newline = false;
+    if (!is_inside_fstring(lex) || is_fstring_formatted_value(lex))
+        had_physical_newline = skip_whitespace(lex, false);
+    #else
     bool had_physical_newline = skip_whitespace(lex, false);
+    #endif
 
     // set token source information
     lex->tok_line = lex->line;
@@ -467,8 +603,15 @@ void mp_lexer_to_next(mp_lexer_t *lex) {
     } else if (is_end(lex)) {
         lex->tok_kind = MP_TOKEN_END;
 
-    } else if (is_string_or_bytes(lex)) {
-        // a string or bytes literal
+    } else if (is_fstring_formatted_value_end(lex)) {
+        // issue the closing token for the formatted value
+        lex->tok_kind = MP_TOKEN_DEL_FORMATTED_VALUE_CLOSE;
+
+        // indicate that we are now back into a literal section of the f-string
+        lex->fstring_section = MP_FSTRING_SECTION_LITERAL;
+
+    } else if (is_string_or_bytes(lex) || is_fstring_literal(lex)) {
+        // a string or bytes literal (or a literal section of an f-string)
 
         // Python requires adjacent string/bytes literals to be automatically
         // concatenated.  We do it here in the tokeniser to make efficient use of RAM,
@@ -481,46 +624,78 @@ void mp_lexer_to_next(mp_lexer_t *lex) {
 
         // Loop to accumulate string/bytes literals
         do {
-            // parse type codes
             bool is_raw = false;
-            mp_token_kind_t kind = MP_TOKEN_STRING;
-            int n_char = 0;
-            if (is_char(lex, 'u')) {
-                n_char = 1;
-            } else if (is_char(lex, 'b')) {
-                kind = MP_TOKEN_BYTES;
-                n_char = 1;
-                if (is_char_following(lex, 'r')) {
-                    is_raw = true;
-                    n_char = 2;
-                }
-            } else if (is_char(lex, 'r')) {
-                is_raw = true;
-                n_char = 1;
-                if (is_char_following(lex, 'b')) {
+            bool is_fstring = false;
+
+            if (!is_fstring_literal(lex)) {
+                // parse type codes
+                mp_token_kind_t kind = MP_TOKEN_STRING;
+                int n_char = 0;
+                if (is_char(lex, 'u')) {
+                    n_char = 1;
+                #if MICROPY_PY_FSTRING
+                } else if (is_char(lex, 'f')) {
+                    if (is_fstring_formatted_value(lex)) {
+                        // f-strings inside f-strings are not allowed
+                        lex->tok_kind = MP_TOKEN_INVALID;
+                    } else {
+                        is_fstring = true;
+                        n_char = 1;
+                        if (is_char_following(lex, 'r')) {
+                            is_raw = true;
+                            n_char = 2;
+                        }
+                    }
+                #endif
+                } else if (is_char(lex, 'b')) {
                     kind = MP_TOKEN_BYTES;
-                    n_char = 2;
+                    n_char = 1;
+                    if (is_char_following(lex, 'r')) {
+                        is_raw = true;
+                        n_char = 2;
+                    }
+                } else if (is_char(lex, 'r')) {
+                    is_raw = true;
+                    n_char = 1;
+                    if (is_char_following(lex, 'b')) {
+                        kind = MP_TOKEN_BYTES;
+                        n_char = 2;
+                    }
+                    #if MICROPY_PY_FSTRING
+                    else if (is_char_following(lex, 'f')) {
+                        if (is_fstring_formatted_value(lex)) {
+                            // f-strings inside f-strings are not allowed
+                            lex->tok_kind = MP_TOKEN_INVALID;
+                        } else {
+                            is_fstring = true;
+                            n_char = 2;
+                        }
+                    }
+                    #endif
                 }
-            }
 
-            // Set or check token kind
-            if (lex->tok_kind == MP_TOKEN_END) {
-                lex->tok_kind = kind;
-            } else if (lex->tok_kind != kind) {
-                // Can't concatenate string with bytes
-                break;
-            }
+                // Set or check token kind
+                if (lex->tok_kind == MP_TOKEN_END) {
+                    lex->tok_kind = kind;
+                } else if (lex->tok_kind != kind) {
+                    // Can't concatenate string with bytes
+                    break;
+                }
 
-            // Skip any type code characters
-            if (n_char != 0) {
-                next_char(lex);
-                if (n_char == 2) {
+                // Skip any type code characters
+                if (n_char != 0) {
                     next_char(lex);
+                    if (n_char == 2) {
+                        next_char(lex);
+                    }
                 }
             }
-
+            else {
+                lex->tok_kind = MP_TOKEN_STRING;
+            }
+            
             // Parse the literal
-            parse_string_literal(lex, is_raw);
+            parse_string_literal(lex, is_raw, is_fstring);
 
             // Skip whitespace so we can check if there's another string following
             skip_whitespace(lex, true);
@@ -620,6 +795,10 @@ void mp_lexer_to_next(mp_lexer_t *lex) {
             if (is_char(lex, '=')) {
                 next_char(lex);
                 lex->tok_kind = MP_TOKEN_OP_NOT_EQUAL;
+            #if MICROPY_PY_FSTRING
+            } else if (is_fstring_formatted_value(lex)) {
+                parse_fstring_format(lex, *t);
+            #endif
             } else {
                 lex->tok_kind = MP_TOKEN_INVALID;
             }
@@ -633,6 +812,18 @@ void mp_lexer_to_next(mp_lexer_t *lex) {
             } else {
                 lex->tok_kind = MP_TOKEN_DEL_PERIOD;
             }
+
+        #if MICROPY_PY_FSTRING
+        } else if (is_fstring_formatted_value(lex) && (*t == '{' || *t == '}' || *t == ':')) {
+            // if we are inside an f-string, we replace the brace separators
+            // to avoid ambiguities with the braces in the grammar
+            if (*t == '{') {
+                lex->tok_kind = MP_TOKEN_DEL_FORMATTED_VALUE_OPEN;
+            }
+            else {
+                parse_fstring_format(lex, *t);
+            }
+        #endif
 
         } else {
             // matched a delimiter or operator character
@@ -665,6 +856,7 @@ void mp_lexer_to_next(mp_lexer_t *lex) {
             }
         }
     }
+    printf("next tok: %d\n", lex->tok_kind);
 }
 
 mp_lexer_t *mp_lexer_new(qstr src_name, mp_reader_t reader) {
@@ -679,6 +871,12 @@ mp_lexer_t *mp_lexer_new(qstr src_name, mp_reader_t reader) {
     lex->alloc_indent_level = MICROPY_ALLOC_LEXER_INDENT_INIT;
     lex->num_indent_level = 1;
     lex->indent_level = m_new(uint16_t, lex->alloc_indent_level);
+    #if MICROPY_PY_FSTRING
+    lex->fstring_quote_char = 0;
+    lex->fstring_num_quotes = 0;
+    lex->fstring_is_raw = false;
+    lex->fstring_section = MP_FSTRING_SECTION_NONE;
+    #endif
     vstr_init(&lex->vstr, 32);
 
     // store sentinel for first indentation level

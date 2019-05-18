@@ -942,7 +942,7 @@ mp_parse_tree_t mp_parse(mp_lexer_t *lex, mp_parse_input_kind_t input_kind) {
                         mp_token_kind_t tok_kind = rule_arg[i] & RULE_ARG_ARG_MASK;
                         if (lex->tok_kind == tok_kind) {
                             // matched token
-                            if (tok_kind == MP_TOKEN_NAME) {
+                            if (tok_kind == MP_TOKEN_NAME || tok_kind == MP_TOKEN_STRING) {
                                 push_result_token(&parser, rule_id);
                             }
                             mp_lexer_to_next(lex);
@@ -992,7 +992,7 @@ mp_parse_tree_t mp_parse(mp_lexer_t *lex, mp_parse_input_kind_t input_kind) {
                     --x;
                     if ((rule_arg[x] & RULE_ARG_KIND_MASK) == RULE_ARG_TOK) {
                         mp_token_kind_t tok_kind = rule_arg[x] & RULE_ARG_ARG_MASK;
-                        if (tok_kind == MP_TOKEN_NAME) {
+                        if (tok_kind == MP_TOKEN_NAME || tok_kind == MP_TOKEN_STRING) {
                             // only tokens which were names are pushed to stack
                             i += 1;
                             num_not_nil += 1;
